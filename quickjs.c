@@ -351,6 +351,8 @@ struct JSRuntime {
     void *user_opaque;
     void *libc_opaque;
     JSRuntimeFinalizerState *finalizers;
+
+    bool coverage_enabled;
 };
 
 struct JSClass {
@@ -801,6 +803,11 @@ typedef struct JSFunctionBytecode {
     int pc2line_len;
     uint8_t *pc2line_buf;
     char *source;
+    /* Coverage support */
+    uint16_t *pc_to_line;
+    uint8_t *line_coverage;
+    int line_base;
+    int line_count;
 } JSFunctionBytecode;
 
 typedef struct JSBoundFunction {
@@ -2558,6 +2565,52 @@ JSValue JS_GetClassProto(JSContext *ctx, JSClassID class_id)
 JSValue JS_GetFunctionProto(JSContext *ctx)
 {
     return js_dup(ctx->function_proto);
+}
+
+void JS_EnableCoverage(JSRuntime *rt)
+{
+    rt->coverage_enabled = true;
+}
+
+void JS_ResetCoverage(JSRuntime *rt)
+{
+    struct list_head *el;
+    JSGCObjectHeader *gp;
+
+    list_for_each(el, &rt->gc_obj_list) {
+        gp = list_entry(el, JSGCObjectHeader, link);
+        if (gp->gc_obj_type == JS_GC_OBJ_TYPE_FUNCTION_BYTECODE) {
+            JSFunctionBytecode *b = (JSFunctionBytecode *)gp;
+            if (b->line_coverage && b->line_count > 0)
+                memset(b->line_coverage, 0, b->line_count);
+        }
+    }
+}
+
+void JS_GetCoverage(JSContext *ctx, JSCoverageLineCb *cb, void *opaque)
+{
+    JSRuntime *rt = ctx->rt;
+    struct list_head *el, *el1;
+    const JSGCObjectHeader *gp;
+
+    list_for_each_safe(el, el1, &rt->gc_obj_list) {
+        gp = list_entry(el, JSGCObjectHeader, link);
+        if (gp->gc_obj_type != JS_GC_OBJ_TYPE_FUNCTION_BYTECODE)
+            continue;
+        const JSFunctionBytecode *b = (const JSFunctionBytecode *)gp;
+        if (!b->line_coverage || b->line_count <= 0 || b->filename == JS_ATOM_NULL)
+            continue;
+
+        size_t fn_len;
+        const char *fn = JS_AtomToCStringLen(ctx, &fn_len, b->filename);
+        if (!fn)
+            continue;
+        for (int i = 0; i < b->line_count; i++) {
+            if (b->line_coverage[i])
+                cb(ctx, fn, b->line_base + i, 1, opaque);
+        }
+        JS_FreeCString(ctx, fn);
+    }
 }
 
 typedef enum JSFreeModuleEnum {
@@ -7628,6 +7681,39 @@ static int get_sleb128(int32_t *pval, const uint8_t *buf,
     }
     *pval = (val >> 1) ^ -(val & 1);
     return ret;
+}
+
+/* Parse one pc2line entry. Returns 0 on success, -1 on error/buffer end.
+   Outputs: *ppc_delta = PC offset, *pnew_line = new line number.
+   Advances *pp past the consumed bytes. */
+static int js_parse_pc2line_entry(const uint8_t **pp, const uint8_t *p_end,
+                                  uint32_t *ppc_delta, int *pnew_line,
+                                  int cur_line)
+{
+    unsigned int op = *pp < p_end ? *(*pp)++ : 0;
+    int v, ret;
+    uint32_t pc_delta;
+
+    if (op == 0) {
+        uint32_t val;
+        ret = get_leb128(&val, *pp, p_end);
+        if (ret < 0) return -1;
+        *pp += ret;
+        pc_delta = val;
+        ret = get_sleb128(&v, *pp, p_end);
+        if (ret < 0) return -1;
+        *pp += ret;
+        *pnew_line = cur_line + v;
+    } else {
+        op -= PC2LINE_OP_FIRST;
+        pc_delta = op / PC2LINE_RANGE;
+        *pnew_line = cur_line + (op % PC2LINE_RANGE) + PC2LINE_BASE;
+    }
+    ret = get_sleb128(&v, *pp, p_end);
+    if (ret < 0) return -1;
+    *pp += ret;
+    *ppc_delta = pc_delta;
+    return 0;
 }
 
 static int find_line_num(JSContext *ctx, JSFunctionBytecode *b,
@@ -17462,8 +17548,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 #define DUMP_BYTECODE_OR_DONT(pc)
 #endif
 
+#define COVERAGE_HIT(pc) \
+    if (unlikely(b->pc_to_line != NULL)) { \
+        uint32_t _cov_off = (uint32_t)((pc) - b->byte_code_buf); \
+        if (likely(_cov_off < (uint32_t)b->byte_code_len)) { \
+            uint16_t _cov_ln = b->pc_to_line[_cov_off]; \
+            if (_cov_ln != 0xFFFF) \
+                b->line_coverage[_cov_ln] = 1; \
+        } \
+    }
+
 #if !DIRECT_DISPATCH
-#define SWITCH(pc)      DUMP_BYTECODE_OR_DONT(pc) switch (opcode = *pc++)
+#define SWITCH(pc)      COVERAGE_HIT(pc) DUMP_BYTECODE_OR_DONT(pc) switch (opcode = *pc++)
 #define CASE(op)        case op
 #define DEFAULT         default
 #define BREAK           break
@@ -17474,7 +17570,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 #include "quickjs-opcode.h"
         [ OP_COUNT ... 255 ] = &&case_default
     };
-#define SWITCH(pc)      DUMP_BYTECODE_OR_DONT(pc) __extension__ ({ goto *dispatch_table[opcode = *pc++]; });
+#define SWITCH(pc)      COVERAGE_HIT(pc) DUMP_BYTECODE_OR_DONT(pc) __extension__ ({ goto *dispatch_table[opcode = *pc++]; });
 #define CASE(op)        case_ ## op
 #define DEFAULT         case_default
 #define BREAK           SWITCH(pc)
@@ -35556,6 +35652,73 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
     b->source = fd->source;
     b->source_len = fd->source_len;
 
+    b->pc_to_line = NULL;
+    b->line_coverage = NULL;
+    b->line_base = 0;
+    b->line_count = 0;
+
+    if (ctx->rt->coverage_enabled && b->pc2line_buf && b->pc2line_len > 0) {
+        int min_line = b->line_num;
+        int max_line = b->line_num;
+        {
+            const uint8_t *p = b->pc2line_buf;
+            const uint8_t *p_end = p + b->pc2line_len;
+            int cur_line = b->line_num;
+            while (p < p_end) {
+                uint32_t pc_delta;
+                int new_line;
+                if (js_parse_pc2line_entry(&p, p_end, &pc_delta, &new_line, cur_line) < 0)
+                    break;
+                cur_line = new_line;
+                if (cur_line < min_line) min_line = cur_line;
+                if (cur_line > max_line) max_line = cur_line;
+            }
+        }
+
+        if (max_line >= min_line && max_line - min_line < 100000) {
+            int lc = max_line - min_line + 1;
+            uint16_t *ptl = js_malloc(ctx, sizeof(uint16_t) * b->byte_code_len);
+            uint8_t *lcov = js_mallocz(ctx, lc);
+            if (ptl && lcov) {
+                memset(ptl, 0xFF, sizeof(uint16_t) * b->byte_code_len);
+                b->line_base = min_line;
+                b->line_count = lc;
+                b->pc_to_line = ptl;
+                b->line_coverage = lcov;
+
+                {
+                    const uint8_t *p = b->pc2line_buf;
+                    const uint8_t *p_end = p + b->pc2line_len;
+                    int cur_line = b->line_num;
+                    uint32_t prev_pc = 0;
+                    uint16_t cur_idx = (cur_line >= min_line && cur_line <= max_line)
+                        ? (uint16_t)(cur_line - min_line) : 0xFFFF;
+
+                    while (p < p_end) {
+                        uint32_t pc_delta;
+                        int new_line;
+                        if (js_parse_pc2line_entry(&p, p_end, &pc_delta, &new_line, cur_line) < 0)
+                            break;
+                        uint32_t next_pc = prev_pc + pc_delta;
+                        if (next_pc > (uint32_t)b->byte_code_len)
+                            next_pc = b->byte_code_len;
+                        for (uint32_t j = prev_pc; j < next_pc && j < (uint32_t)b->byte_code_len; j++)
+                            ptl[j] = cur_idx;
+                        prev_pc = next_pc;
+                        cur_line = new_line;
+                        cur_idx = (cur_line >= min_line && cur_line <= max_line)
+                            ? (uint16_t)(cur_line - min_line) : 0xFFFF;
+                    }
+                    for (uint32_t j = prev_pc; j < (uint32_t)b->byte_code_len; j++)
+                        ptl[j] = cur_idx;
+                }
+            } else {
+                js_free(ctx, ptl);
+                js_free(ctx, lcov);
+            }
+        }
+    }
+
     if (fd->scopes != fd->def_scope_array)
         js_free(ctx, fd->scopes);
 
@@ -35628,6 +35791,8 @@ static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
     JS_FreeAtomRT(rt, b->filename);
     js_free_rt(rt, b->pc2line_buf);
     js_free_rt(rt, b->source);
+    js_free_rt(rt, b->pc_to_line);
+    js_free_rt(rt, b->line_coverage);
 
     remove_gc_object(&b->header);
     if (rt->gc_phase == JS_GC_PHASE_REMOVE_CYCLES && b->header.ref_count != 0) {

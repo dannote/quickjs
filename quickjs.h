@@ -543,6 +543,12 @@ JS_EXTERN void JS_SetClassProto(JSContext *ctx, JSClassID class_id, JSValue obj)
 JS_EXTERN JSValue JS_GetClassProto(JSContext *ctx, JSClassID class_id);
 JS_EXTERN JSValue JS_GetFunctionProto(JSContext *ctx);
 
+/* Line coverage */
+JS_EXTERN void JS_EnableCoverage(JSRuntime *rt);
+JS_EXTERN void JS_ResetCoverage(JSRuntime *rt);
+typedef void JSCoverageLineCb(JSContext *ctx, const char *filename, int line, int hit, void *opaque);
+JS_EXTERN void JS_GetCoverage(JSContext *ctx, JSCoverageLineCb *cb, void *opaque);
+
 /* the following functions are used to select the intrinsic object to
    save memory */
 JS_EXTERN JSContext *JS_NewContextRaw(JSRuntime *rt);

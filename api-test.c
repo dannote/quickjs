@@ -1018,6 +1018,60 @@ static void new_symbol(void)
     JS_FreeRuntime(rt);
 }
 
+
+static int coverage_line_count;
+static int coverage_hit_lines[16];
+static const char *coverage_filename;
+
+static void coverage_cb(JSContext *ctx, const char *filename, int line, int hit, void *opaque)
+{
+    (void)ctx;
+    (void)hit;
+    (void)opaque;
+    coverage_filename = filename;
+    if (coverage_line_count < 16)
+        coverage_hit_lines[coverage_line_count++] = line;
+}
+
+static void coverage(void)
+{
+    JSRuntime *rt;
+    JSContext *ctx;
+    JSValue ret;
+
+    rt = JS_NewRuntime();
+    ctx = JS_NewContext(rt);
+    assert(rt && ctx);
+
+    JS_EnableCoverage(rt);
+
+    /* Run code that covers some but not all lines */
+    ret = JS_Eval(ctx,
+        "function add(a, b) { return a + b; }\n"
+        "function sub(a, b) { return a - b; }\n"
+        "add(1, 2);\n",
+        0, "test.js", JS_EVAL_TYPE_GLOBAL);
+    assert(!JS_IsException(ret));
+    JS_FreeValue(ctx, ret);
+
+    /* Get coverage via callback */
+    coverage_line_count = 0;
+    JS_GetCoverage(ctx, coverage_cb, NULL);
+    assert(coverage_line_count > 0);
+    assert(strcmp(coverage_filename, "test.js") == 0);
+    /* Line 1 (add function body) was executed */
+    assert(coverage_hit_lines[0] == 1);
+
+    /* Reset — coverage should be empty */
+    JS_ResetCoverage(rt);
+    coverage_line_count = 0;
+    JS_GetCoverage(ctx, coverage_cb, NULL);
+    assert(coverage_line_count == 0);
+
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
 int main(void)
 {
     cfunctions();
@@ -1038,5 +1092,6 @@ int main(void)
     immutable_array_buffer();
     get_uint8array();
     new_symbol();
+    coverage();
     return 0;
 }
